@@ -147,6 +147,7 @@ pub async fn put(
     let email = req.headers().get("oxen-commit-email");
     let message = req.headers().get("oxen-commit-message");
 
+
     // Create temporary workspace
     let workspace = repositories::workspaces::create_temporary(&repo, &commit)?;
 
@@ -169,6 +170,26 @@ pub async fn put(
             |m| m.to_str().unwrap().to_string(),
         ),
     };
+
+    // Retrieve the latest commit for the branch
+    let latest_commit = repositories::commits::get_by_id(&repo, &branch.commit_id)?
+        .ok_or(OxenError::revision_not_found(branch.commit_id.clone().into()))?;
+
+    // Get the file entry for the resource path at the latest commit
+    let head_entry = repositories::entries::get_file(&repo, &latest_commit, &resource.path)?;
+
+    if let Some(head_entry) = head_entry {
+        let last_entry_hash = head_entry.hash().to_string();
+        let oxen_entry_hash = req.headers().get("oxen-entry-hash");
+
+        if let Some(entry_hash) = oxen_entry_hash {
+            if entry_hash.to_str().unwrap() != last_entry_hash {
+                return Err(OxenHttpError::BadRequest("Resource has been updated since the last revision you're referring to in this PUT. Please pull the latest changes.".into()));
+            }
+        }
+    }
+    // TODO - BadRequest if oxen-entry-hash specified and no prior version (new resource)
+    
     let commit = repositories::workspaces::commit(&workspace, &commit_body, branch.name)?;
     log::debug!("file::put workspace commit ✅ success! commit {:?}", commit);
 
@@ -336,9 +357,10 @@ mod tests {
         let req = actix_web::test::TestRequest::put()
             .uri(&uri)
             .app_data(OxenAppData::new(sync_dir.to_path_buf()))
+            .insert_header(("oxen-entry-hash", ""))
             .param("namespace", namespace)
             .param("repo_name", repo_name)
-            .param("resource", "hello.txt");
+            .param("resource", "data/hello.txt");
 
         let req = headers
             .into_iter()
@@ -367,11 +389,50 @@ mod tests {
         let entry =
             repositories::entries::get_file(&repo, &resp.commit, PathBuf::from("data/hello.txt"))?
                 .unwrap();
-        let version_path = util::fs::version_path_from_hash(&repo, entry.hash().to_string());
+        let entry_hash = entry.hash().to_string();
+        println!("First upload entry hash: {}", entry_hash);
+        let version_path = util::fs::version_path_from_hash(&repo, entry_hash);
         let updated_content = util::fs::read_from_path(&version_path)?;
         assert_eq!(updated_content, "Updated Content!");
 
-        // cleanup
+        // Perform a second PUT request to update the file again
+        let (body, headers) = create_form_data_payload_and_headers(
+            "file",
+            Some("hello.txt".to_owned()),
+            Some(mime::TEXT_PLAIN_UTF_8),
+            Bytes::from_static(b"Second Update!"),
+        );
+
+        let req = actix_web::test::TestRequest::put()
+            .uri(&uri)
+            .app_data(OxenAppData::new(sync_dir.to_path_buf()))
+            .insert_header(("oxen-entry-hash", "294252e5a1c9461858ff81c0a69a0fb8"))
+            .param("namespace", namespace)
+            .param("repo_name", repo_name)
+            .param("resource", "hello.txt");
+
+        let req = headers
+            .into_iter()
+            .fold(req, |req, hdr| req.insert_header(hdr))
+            .set_payload(body)
+            .to_request();
+
+        let resp = actix_web::test::call_service(&app, req).await;
+        let bytes = actix_http::body::to_bytes(resp.into_body()).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        println!("Second upload response: {}", body);
+        let resp: CommitResponse = serde_json::from_str(body)?;
+        assert_eq!(resp.status.status, "success");
+
+        // Check that the file was updated again
+        let entry =
+            repositories::entries::get_file(&repo, &resp.commit, PathBuf::from("data/hello.txt"))?
+                .unwrap();
+        let entry_hash = entry.hash().to_string();
+        println!("Second upload entry hash: {}", entry_hash);
+        let version_path = util::fs::version_path_from_hash(&repo, entry_hash);
+        let updated_content = util::fs::read_from_path(&version_path)?;
+        assert_eq!(updated_content, "Second Update!");
         util::fs::remove_dir_all(sync_dir)?;
 
         Ok(())
