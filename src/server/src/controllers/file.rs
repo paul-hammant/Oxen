@@ -125,17 +125,6 @@ pub async fn put(
             resource.version.to_string_lossy(),
         ))?;
     let commit = resource.commit.ok_or(OxenHttpError::NotFound)?;
-    // Make sure the resource path is not already a file
-    let node = repositories::tree::get_node_by_path(&repo, &commit, &resource.path)?;
-    if node.is_some() && node.unwrap().is_file() {
-        return Err(OxenHttpError::BasicError(
-            format!(
-                "Target path must be a directory: {}",
-                resource.path.display()
-            )
-            .into(),
-        ));
-    }
 
     // Optional commit info
     let author = req.headers().get("oxen-commit-author");
