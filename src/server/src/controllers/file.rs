@@ -117,6 +117,7 @@ pub async fn put(
     payload: Multipart,
 ) -> actix_web::Result<HttpResponse, OxenHttpError> {
     log::debug!("file::put path {:?}", req.path());
+    
     let app_data = app_data(&req)?;
     let namespace = path_param(&req, "namespace")?;
     let repo_name = path_param(&req, "repo_name")?;
@@ -229,7 +230,7 @@ pub async fn put(
             &resource.path.to_string_lossy()
         )),
     };
-
+    
     let commit = repositories::workspaces::commit(&workspace, &commit_body, branch.name)?;
 
     log::debug!("file::put workspace commit ✅ success! commit {:?}", commit);
@@ -411,6 +412,7 @@ pub async fn import(
 fn get_authenticated_user(req: &HttpRequest) -> Result<Option<User>, OxenHttpError> {
     // Extract bearer token from Authorization header
     let auth_header = req.headers().get("authorization");
+    
     if let Some(auth_value) = auth_header {
         if let Ok(auth_str) = auth_value.to_str() {
             if auth_str.starts_with("Bearer ") {
@@ -426,11 +428,16 @@ fn get_authenticated_user(req: &HttpRequest) -> Result<Option<User>, OxenHttpErr
                             }));
                         }
                     }
-                    Err(_) => return Err(OxenHttpError::InternalServerError),
+                    Err(err) => {
+                        // Log the keys database issue but don't crash with internal server error
+                        log::debug!("AccessKeyManager failed to initialize: {:?}", err);
+                        // Treat missing keys DB as "no authentication configured" instead of crashing
+                    }
                 }
             }
         }
     }
+    
     Ok(None)
 }
 

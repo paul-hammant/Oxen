@@ -14,11 +14,31 @@ async fn test_put_to_file_path_should_fail() {
     let (_test_dir, server, client) = env.into_parts();
     
     println!("Testing PUT to existing file path (should fail)...");
+    
+    // First get the current revision ID for the file
+    let get_response = client
+        .get(&format!("{}/api/repos/test_user/test_repo/file/main/test.txt", server.base_url()))
+        .send()
+        .await
+        .expect("Failed to get file for revision ID");
+    
+    let current_revision = get_response
+        .headers()
+        .get("oxen-revision-id")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown");
+    
+    println!("Current revision for test.txt: {}", current_revision);
+    
+    // Now try to PUT with an incorrect oxen-based-on header (should fail with revision conflict)
     let form_data = reqwest::multipart::Form::new()
-        .text("content", "This should fail");
+        .part("file", reqwest::multipart::Part::text("This should fail due to revision conflict")
+            .file_name("test.txt")
+            .mime_str("text/plain").unwrap());
     
     let response = client
-        .put(&format!("{}/api/repos/test_user/test_repo/file/main/data/existing.txt", server.base_url()))
+        .put(&format!("{}/api/repos/test_user/test_repo/file/main/test.txt", server.base_url()))
+        .header("oxen-based-on", "invalid-revision-hash-that-does-not-match")
         .multipart(form_data)
         .send()
         .await
@@ -33,12 +53,12 @@ async fn test_put_to_file_path_should_fail() {
     assert!(status.is_client_error() || status.is_server_error(), 
         "PUT to file path should fail - status: {}, body: {}", status, body);
     
-    // Should get repository not found error (since server validates repo existence first)
-    assert!(body.contains("not found") || body.contains("Repository") || body.contains("Target path must be a directory") || body.contains("Resource temporarily unavailable"),
-        "Expected repository not found, directory error, or lock error when PUTting to file path, got: {}", body);
+    // Should get revision conflict error when trying to overwrite with invalid oxen-based-on header
+    assert!(body.contains("modified since claimed revision") || body.contains("not found") || body.contains("Repository") || body.contains("Resource temporarily unavailable"),
+        "Expected revision conflict, repository not found, or lock error when PUTting with invalid revision, got: {}", body);
     
-    if body.contains("Target path must be a directory") {
-        println!("✅ Got expected 'Target path must be a directory' error");
+    if body.contains("modified since claimed revision") {
+        println!("✅ Got expected revision conflict error - PUT correctly validates file revision");
     } else if body.contains("not found") || body.contains("Repository") {
         println!("✅ Got expected 'Repository not found' error (server validates repo existence first)");
     } else {

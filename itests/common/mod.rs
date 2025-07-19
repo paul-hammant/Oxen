@@ -443,9 +443,9 @@ impl TestEnvironmentBuilder {
         std::fs::create_dir_all(&test_dir).expect("Failed to create test directory");
         
         // Create repository if requested
-        if create_repo {
+        let repo_dir = if create_repo {
             let repo_type = self.repo_type.unwrap_or(RepoType::WithTestFiles);
-            let _result = match repo_type {
+            let result = match repo_type {
                 RepoType::WithTestFiles => {
                     make_initialized_repo_with_test_files_in_memory(&test_dir).await?.0
                 }
@@ -474,7 +474,10 @@ impl TestEnvironmentBuilder {
                     result.repo_dir
                 }
             };
-        }
+            Some(result)
+        } else {
+            None
+        };
         
         // Start oxen-server with auto-port allocation
         let server = TestServer::start_with_auto_port(&test_dir).await
@@ -501,6 +504,7 @@ impl TestEnvironmentBuilder {
         
         Ok(TestEnvironment {
             test_dir,
+            repo_dir,
             server,
             client,
             cleanup: true,
@@ -511,6 +515,7 @@ impl TestEnvironmentBuilder {
 /// RAII Test environment that automatically cleans up
 pub struct TestEnvironment {
     test_dir: std::path::PathBuf,
+    repo_dir: Option<std::path::PathBuf>, // Track the actual repo directory for DB cache cleanup
     server: TestServer,
     client: reqwest::Client,
     cleanup: bool,
@@ -521,25 +526,30 @@ impl TestEnvironment {
         TestEnvironmentBuilder::new()
     }
 
-    /// Create a valid bearer token for testing
+    /// Create a valid bearer token for testing that works with the server's AccessKeyManager
     #[allow(dead_code)]
     pub fn create_test_bearer_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        // For now, let's use the server's sync directory to create a valid token
-        // We'll need to access the server's auth module through the file system
-        // This is a temporary solution until we can properly access the server crate
-        
         // Create a test user
         let test_user = liboxen::model::User {
             name: "Test User".to_string(),
             email: "test@example.com".to_string(),
         };
         
-        // Get the sync directory from the server - this should be the same directory the test server uses
-        let sync_dir = self.test_dir.join("sync");
-        std::fs::create_dir_all(&sync_dir)?;
+        // Set up the server's access key infrastructure
+        // The server expects keys to be in sync_dir/.oxen/
+        let oxen_hidden_dir = liboxen::util::fs::oxen_hidden_dir(&self.test_dir);
+        std::fs::create_dir_all(&oxen_hidden_dir)?;
         
-        // For now, create a mock JWT token that matches the expected format
-        // In a real implementation, this would use the server's AccessKeyManager
+        // Create the secret key file that AccessKeyManager expects
+        let secret_key_path = oxen_hidden_dir.join("SECRET_KEY_BASE");
+        let secret = "test-secret-key-for-oxen-testing-only";
+        liboxen::util::fs::write_to_path(&secret_key_path, secret)?;
+        
+        // Create the keys database directory that AccessKeyManager expects
+        let keys_dir = oxen_hidden_dir.join("keys");
+        std::fs::create_dir_all(&keys_dir)?;
+        
+        // Create a JWT token manually since we can't import the server crate
         use jsonwebtoken::{encode, Header, EncodingKey};
         use serde::{Deserialize, Serialize};
         
@@ -561,9 +571,6 @@ impl TestEnvironment {
                 .as_secs() as usize,
         };
 
-        // IMPORTANT: This is a test-only JWT implementation
-        // Production systems should use proper key management
-        let secret = "test-secret-key-for-oxen-testing-only";
         let token = encode(
             &Header::default(),
             &claims,
@@ -591,6 +598,13 @@ impl TestEnvironment {
     pub fn into_parts(mut self) -> (std::path::PathBuf, TestServer, reqwest::Client) {
         // Disable cleanup since caller is taking ownership
         self.cleanup = false;
+        
+        // Release DB cache instances to prevent LOCK file conflicts with server
+        // This closes any RocksDB instances opened during repository initialization
+        if let Some(repo_dir) = &self.repo_dir {
+            let _ = liboxen::core::staged::remove_from_cache_with_children(repo_dir);
+            let _ = liboxen::core::refs::remove_from_cache(repo_dir);
+        }
         
         // Safely move out fields using mem::replace
         let test_dir = std::mem::replace(&mut self.test_dir, std::path::PathBuf::new());
@@ -627,18 +641,24 @@ pub async fn create_test_environment_with_auto_port() -> Result<(std::path::Path
 pub async fn make_initialized_repo_with_test_files_in_memory(base_dir: &std::path::Path) -> Result<(std::path::PathBuf, liboxen::model::LocalRepository), Box<dyn std::error::Error>> {
     let result = TestRepoBuilder::new()
         .base_dir(base_dir)
-        .repo_name("memory_test_repo")
+        .repo_name("test_repo")
         .namespace("test_user")
         .user_name("Test User")
         .user_email("test@example.com")
         .commit_message("Initial commit with test files")
         .add_file("test.txt", "Hello from Oxen integration test!\nThis is real file content.")
         .add_file("data.csv", "name,age,city\nAlice,30,New York\nBob,25,San Francisco\nCharlie,35,Chicago")
-        .use_in_memory_storage(true)
+        .use_in_memory_storage(false)
         .build()
         .await?;
     
-    Ok((result.repo_dir, result.repo.unwrap()))
+    let repo = if let Some(repo) = result.repo {
+        repo
+    } else {
+        // For non-in-memory storage, we need to load the repo from the directory
+        liboxen::model::LocalRepository::from_dir(&result.repo_dir)?
+    };
+    Ok((result.repo_dir, repo))
 }
 
 /// Helper function to initialize a repository with in-memory storage using composition
