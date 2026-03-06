@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // use liboxen::constants::DEFAULT_REDIS_URL;
 use liboxen::error::OxenError;
@@ -32,6 +32,14 @@ pub fn create_user_from_options(
         name: name.ok_or(OxenHttpError::BadRequest("Name is required".into()))?,
         email: email.ok_or(OxenHttpError::BadRequest("Email is required".into()))?,
     })
+}
+
+pub fn get_repo_path(
+    base_path: &Path,
+    namespace: impl AsRef<str>,
+    repo_name: impl AsRef<str>,
+) -> PathBuf {
+    base_path.join(namespace.as_ref()).join(repo_name.as_ref())
 }
 
 // #[allow(dependency_on_unit_never_type_fallback)]
