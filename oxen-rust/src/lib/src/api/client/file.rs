@@ -239,7 +239,7 @@ pub async fn delete_file(
 #[cfg(test)]
 mod tests {
 
-    use actix_web::web::Bytes;
+    use bytes::Bytes;
 
     use crate::constants::DEFAULT_BRANCH_NAME;
     use crate::error::OxenError;
