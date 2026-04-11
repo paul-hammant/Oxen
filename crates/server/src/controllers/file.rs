@@ -293,7 +293,7 @@ async fn put_raw(
         .ok_or_else(|| OxenError::local_branch_not_found(resource.version.to_string_lossy()))?;
     let commit = resource.commit.ok_or(OxenHttpError::NotFound)?;
 
-    check_oxen_based_on(&req, &repo, &commit, &resource.path)?;
+    let based_on_result = check_oxen_based_on(&req, &repo, &commit, &resource.path)?;
 
     ensure_no_file_ancestors_in_tree(&repo, &commit, &resource.path, &resource.path)?;
 
@@ -316,9 +316,59 @@ async fn put_raw(
 
     let user = create_user_from_options(name.clone(), email.clone())?;
 
+    // Handle auto-merge for mismatched oxen-based-on
+    let (file_content, merged_content, head_content_bytes) =
+        if let OxenBasedOnResult::Mismatch { claimed_commit_id } = &based_on_result {
+            let version_store = repo.version_store()?;
+
+            let base_commit = repositories::commits::get_by_id(&repo, claimed_commit_id)?
+                .ok_or(OxenHttpError::NotFound)?;
+            let base_entry =
+                repositories::tree::get_file_by_path(&repo, &base_commit, &resource.path)?
+                    .ok_or(OxenHttpError::NotFound)?;
+            let base_content = version_store
+                .get_version(&base_entry.hash().to_string())
+                .await?;
+
+            let head_entry = repositories::tree::get_file_by_path(&repo, &commit, &resource.path)?
+                .ok_or(OxenHttpError::NotFound)?;
+            let head_content = version_store
+                .get_version(&head_entry.hash().to_string())
+                .await?;
+
+            let ours_content = body.to_vec();
+
+            let merged_text = liboxen::core::v_latest::merge::try_text_merge(
+                &base_content,
+                &ours_content,
+                &head_content,
+            )
+            .map_err(|e| OxenHttpError::BadRequest(e.to_string().into()))?;
+
+            let merged_bytes = merged_text.as_bytes().to_vec();
+            (
+                FileContents::Binary(merged_bytes),
+                Some(merged_text),
+                Some(head_content),
+            )
+        } else {
+            (FileContents::Binary(body.to_vec()), None, None)
+        };
+
+    // If the merged content is identical to the current HEAD content, no commit is needed
+    if let (Some(merged_text), Some(head_bytes)) = (&merged_content, &head_content_bytes)
+        && merged_text.as_bytes() == head_bytes.as_slice()
+    {
+        return Ok(HttpResponse::Ok().json(CommitResponse {
+            status: StatusMessage::resource_created(),
+            commit,
+            merged_content,
+        }));
+    }
+
     let file = FileNew {
         path: resource.path.clone(),
-        contents: FileContents::Binary(body.to_vec()),
+        contents: file_content,
         user,
     };
 
@@ -342,6 +392,7 @@ async fn put_raw(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_created(),
         commit,
+        merged_content,
     }))
 }
 
@@ -375,7 +426,7 @@ async fn put_multipart(
         .ok_or_else(|| OxenError::local_branch_not_found(resource.version.to_string_lossy()))?;
     let commit = resource.commit.ok_or(OxenHttpError::NotFound)?;
 
-    check_oxen_based_on(&req, &repo, &commit, &resource.path)?;
+    let based_on_result = check_oxen_based_on(&req, &repo, &commit, &resource.path)?;
 
     let node = repositories::tree::get_node_by_path(&repo, &commit, &resource.path)?;
     let upload_mode = resolve_upload_mode(
@@ -406,13 +457,70 @@ async fn put_multipart(
     }
 
     let user = create_user_from_options(name.clone(), email.clone())?;
-    let files = build_files_from_upload_parts(
+    let mut files = build_files_from_upload_parts(
         &resource.path,
         upload_mode,
         file_parts,
         &files_array_parts,
         &user,
     )?;
+
+    // Handle auto-merge for mismatched oxen-based-on (single file only)
+    let (merged_content, head_content_bytes) =
+        if let OxenBasedOnResult::Mismatch { claimed_commit_id } = &based_on_result {
+            if files.len() == 1 {
+                let version_store = repo.version_store()?;
+
+                let base_commit = repositories::commits::get_by_id(&repo, claimed_commit_id)?
+                    .ok_or(OxenHttpError::NotFound)?;
+                let base_entry =
+                    repositories::tree::get_file_by_path(&repo, &base_commit, &files[0].path)?
+                        .ok_or(OxenHttpError::NotFound)?;
+                let base_content = version_store
+                    .get_version(&base_entry.hash().to_string())
+                    .await?;
+
+                let head_entry =
+                    repositories::tree::get_file_by_path(&repo, &commit, &files[0].path)?
+                        .ok_or(OxenHttpError::NotFound)?;
+                let head_content = version_store
+                    .get_version(&head_entry.hash().to_string())
+                    .await?;
+
+                let ours_content = match &files[0].contents {
+                    FileContents::Text(text) => text.as_bytes().to_vec(),
+                    FileContents::Binary(bytes) => bytes.clone(),
+                };
+
+                let merged_text = liboxen::core::v_latest::merge::try_text_merge(
+                    &base_content,
+                    &ours_content,
+                    &head_content,
+                )
+                .map_err(|e| OxenHttpError::BadRequest(e.to_string().into()))?;
+
+                files[0].contents = FileContents::Binary(merged_text.as_bytes().to_vec());
+                (Some(merged_text), Some(head_content))
+            } else {
+                return Err(OxenHttpError::BadRequest(
+                    "oxen-based-on mismatch: cannot auto-merge multi-file uploads".into(),
+                ));
+            }
+        } else {
+            (None, None)
+        };
+
+    // If the merged content is identical to the current HEAD content, no commit is needed
+    if let (Some(merged_text), Some(head_bytes)) = (&merged_content, &head_content_bytes)
+        && merged_text.as_bytes() == head_bytes.as_slice()
+    {
+        return Ok(HttpResponse::Ok().json(CommitResponse {
+            status: StatusMessage::resource_created(),
+            commit,
+            merged_content,
+        }));
+    }
+
     let workspace = repositories::workspaces::create_temporary(&repo, &commit)?;
 
     for file in &files {
@@ -437,6 +545,7 @@ async fn put_multipart(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_created(),
         commit,
+        merged_content,
     }))
 }
 
@@ -482,7 +591,11 @@ pub async fn delete(
     let commit = resource.commit.clone().ok_or(OxenHttpError::NotFound)?;
     let path = resource.path;
 
-    check_oxen_based_on(&req, &repo, &commit, &path)?;
+    if let OxenBasedOnResult::Mismatch { .. } = check_oxen_based_on(&req, &repo, &commit, &path)? {
+        return Err(OxenHttpError::BadRequest(
+            "File has been modified since claimed revision. Cannot auto-merge a delete.".into(),
+        ));
+    }
 
     let name = form.name();
     let email = form.email();
@@ -511,6 +624,7 @@ pub async fn delete(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_deleted(),
         commit,
+        merged_content: None,
     }))
 }
 
@@ -625,7 +739,17 @@ pub async fn mv(req: HttpRequest, body: String) -> actix_web::Result<HttpRespons
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_updated(),
         commit,
+        merged_content: None,
     }))
+}
+
+enum OxenBasedOnResult {
+    /// No oxen-based-on header provided, or file is new -- proceed normally.
+    Proceed,
+    /// Header matches current file revision -- proceed normally.
+    Matches,
+    /// Header mismatches -- includes the claimed commit ID for merge attempt.
+    Mismatch { claimed_commit_id: String },
 }
 
 fn check_oxen_based_on(
@@ -633,32 +757,29 @@ fn check_oxen_based_on(
     repo: &liboxen::model::LocalRepository,
     commit: &Commit,
     path: &Path,
-) -> Result<(), OxenHttpError> {
+) -> Result<OxenBasedOnResult, OxenHttpError> {
     let claimed = match req
         .headers()
         .get("oxen-based-on")
         .and_then(|v| v.to_str().ok())
     {
         Some(v) => v,
-        None => return Ok(()), // No concurrency check requested
+        None => return Ok(OxenBasedOnResult::Proceed),
     };
 
     let node = repositories::tree::get_node_by_path(repo, commit, path)?;
     let node = match node {
         Some(n) if n.is_file() => n,
-        _ => return Ok(()), // File doesn't exist, treat as new file creation
+        _ => return Ok(OxenBasedOnResult::Proceed), // File doesn't exist
     };
 
     let current_id = node.latest_commit_id()?.to_string();
     if current_id == claimed {
-        Ok(())
+        Ok(OxenBasedOnResult::Matches)
     } else {
-        Err(OxenHttpError::BadRequest(
-            format!(
-                "File has been modified since claimed revision. Current: {current_id}, Claimed: {claimed}. Your changes would overwrite another change without that being from a merge"
-            )
-            .into(),
-        ))
+        Ok(OxenBasedOnResult::Mismatch {
+            claimed_commit_id: claimed.to_string(),
+        })
     }
 }
 
@@ -705,6 +826,7 @@ async fn handle_initial_put_empty_repo(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_created(),
         commit: commit.unwrap(),
+        merged_content: None,
     }))
 }
 
@@ -1734,7 +1856,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert!(
+            resp.status().is_client_error(),
+            "Expected a 4xx error for mismatched oxen-based-on with fake hash, got {}",
+            resp.status()
+        );
 
         test::cleanup_sync_dir(&sync_dir)?;
         Ok(())
@@ -1765,6 +1891,296 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_auto_merge_non_overlapping() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-AutoMerge-NonOverlap";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+
+        // Create initial file with 3 lines
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::create_dir_all(hello_file.parent().expect("parent dir"))?;
+        util::fs::write_to_path(&hello_file, "line1\nline2\nline3\n")?;
+        repositories::add(&repo, &hello_file).await?;
+        let base_commit = repositories::commit(&repo, "Base commit")?;
+
+        // Record the base commit id for the file
+        let base_node =
+            repositories::tree::get_node_by_path(&repo, &base_commit, Path::new("data/hello.txt"))?
+                .expect("file node should exist");
+        let base_hash = base_node.latest_commit_id()?.to_string();
+
+        // "Theirs" change: modify line3 (without oxen-based-on, so it just overwrites)
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1\nline2\nline3-theirs\n".to_vec(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        // "Ours" change: modify line1, using base_hash as oxen-based-on
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1-ours\nline2\nline3\n".to_vec(),
+            Some(&base_hash),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let bytes = actix_http::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = std::str::from_utf8(&bytes).expect("valid utf-8 response");
+        let resp: CommitResponse =
+            serde_json::from_str(body_str).expect("valid CommitResponse JSON");
+
+        // The merge should combine ours (line1 changed) and theirs (line3 changed)
+        assert_eq!(
+            resp.merged_content,
+            Some("line1-ours\nline2\nline3-theirs\n".to_string())
+        );
+
+        // Verify the file content in the version store matches
+        let entry =
+            repositories::entries::get_file(&repo, &resp.commit, PathBuf::from("data/hello.txt"))?
+                .expect("file entry should exist");
+        let version_store = repo.version_store()?;
+        let stored = version_store.get_version(&entry.hash().to_string()).await?;
+        assert_eq!(
+            String::from_utf8(stored).expect("stored content should be valid utf-8"),
+            "line1-ours\nline2\nline3-theirs\n"
+        );
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_auto_merge_conflict_rejected() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-AutoMerge-Conflict";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::create_dir_all(hello_file.parent().expect("parent dir"))?;
+        util::fs::write_to_path(&hello_file, "line1\nline2\nline3\n")?;
+        repositories::add(&repo, &hello_file).await?;
+        let base_commit = repositories::commit(&repo, "Base commit")?;
+
+        let base_node =
+            repositories::tree::get_node_by_path(&repo, &base_commit, Path::new("data/hello.txt"))?
+                .expect("file node should exist");
+        let base_hash = base_node.latest_commit_id()?.to_string();
+
+        // "Theirs" changes line1
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1-theirs\nline2\nline3\n".to_vec(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        // "Ours" also changes line1 -- conflict
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1-ours\nline2\nline3\n".to_vec(),
+            Some(&base_hash),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_auto_merge_identical_changes() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-AutoMerge-Identical";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::create_dir_all(hello_file.parent().expect("parent dir"))?;
+        util::fs::write_to_path(&hello_file, "line1\nline2\nline3\n")?;
+        repositories::add(&repo, &hello_file).await?;
+        let base_commit = repositories::commit(&repo, "Base commit")?;
+
+        let base_node =
+            repositories::tree::get_node_by_path(&repo, &base_commit, Path::new("data/hello.txt"))?
+                .expect("file node should exist");
+        let base_hash = base_node.latest_commit_id()?.to_string();
+
+        // Both make the same change to line1
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1-same\nline2\nline3\n".to_vec(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"line1-same\nline2\nline3\n".to_vec(),
+            Some(&base_hash),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let bytes = actix_http::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = std::str::from_utf8(&bytes).expect("valid utf-8 response");
+        let resp: CommitResponse =
+            serde_json::from_str(body_str).expect("valid CommitResponse JSON");
+        assert_eq!(
+            resp.merged_content,
+            Some("line1-same\nline2\nline3\n".to_string())
+        );
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_auto_merge_binary_rejected() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-AutoMerge-Binary";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+
+        // Create a binary file (invalid UTF-8)
+        let bin_file = repo.path.join("data/image.bin");
+        util::fs::create_dir_all(bin_file.parent().expect("parent dir"))?;
+        util::fs::write(&bin_file, &[0xFF, 0xFE, 0x00, 0x01])?;
+        repositories::add(&repo, &bin_file).await?;
+        let base_commit = repositories::commit(&repo, "Base commit")?;
+
+        let base_node =
+            repositories::tree::get_node_by_path(&repo, &base_commit, Path::new("data/image.bin"))?
+                .expect("file node should exist");
+        let base_hash = base_node.latest_commit_id()?.to_string();
+
+        // Overwrite with different binary (without oxen-based-on, to make it stale)
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/image.bin",
+            "application/octet-stream",
+            vec![0xAA, 0xBB, 0xCC],
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        // Attempt merge with stale oxen-based-on -- should fail because binary
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/image.bin",
+            "application/octet-stream",
+            vec![0xDD, 0xEE, 0xFF],
+            Some(&base_hash),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_auto_merge_deleted_file_creates_new() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-AutoMerge-Deleted";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+
+        // Create file and commit
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::create_dir_all(hello_file.parent().expect("parent dir"))?;
+        util::fs::write_to_path(&hello_file, "original content")?;
+        repositories::add(&repo, &hello_file).await?;
+        let base_commit = repositories::commit(&repo, "Base commit")?;
+
+        let base_node =
+            repositories::tree::get_node_by_path(&repo, &base_commit, Path::new("data/hello.txt"))?
+                .expect("file node should exist");
+        let base_hash = base_node.latest_commit_id()?.to_string();
+
+        // Delete the file
+        let del_resp =
+            do_delete_with_header(&sync_dir, namespace, repo_name, "main/data/hello.txt", None)
+                .await;
+        assert_eq!(del_resp.status(), actix_web::http::StatusCode::OK);
+
+        // PUT with stale oxen-based-on -- file doesn't exist at HEAD,
+        // so check_oxen_based_on returns Proceed and the file is created anew
+        let resp = do_raw_put(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "main/data/hello.txt",
+            "text/plain",
+            b"resurrected content".to_vec(),
+            Some(&base_hash),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let bytes = actix_http::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = std::str::from_utf8(&bytes).expect("valid utf-8 response");
+        let resp: CommitResponse =
+            serde_json::from_str(body_str).expect("valid CommitResponse JSON");
+        assert_eq!(resp.status.status, "success");
+
+        // Verify file content
+        let entry =
+            repositories::entries::get_file(&repo, &resp.commit, PathBuf::from("data/hello.txt"))?
+                .expect("file entry should exist");
+        let version_store = repo.version_store()?;
+        let stored = version_store.get_version(&entry.hash().to_string()).await?;
+        assert_eq!(
+            String::from_utf8(stored).expect("stored content should be valid utf-8"),
+            "resurrected content"
+        );
 
         test::cleanup_sync_dir(&sync_dir)?;
         Ok(())

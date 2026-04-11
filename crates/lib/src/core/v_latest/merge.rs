@@ -24,6 +24,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str;
 
+/// Attempt a 3-way text merge of file content.
+/// Returns the merged text on success, or an error if the files are binary or have conflicts.
+pub fn try_text_merge(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<String, OxenError> {
+    let base_str = std::str::from_utf8(base).map_err(|_| {
+        OxenError::basic_str("Cannot text-merge binary content (base is not valid UTF-8)")
+    })?;
+    let ours_str = std::str::from_utf8(ours).map_err(|_| {
+        OxenError::basic_str("Cannot text-merge binary content (ours is not valid UTF-8)")
+    })?;
+    let theirs_str = std::str::from_utf8(theirs).map_err(|_| {
+        OxenError::basic_str("Cannot text-merge binary content (theirs is not valid UTF-8)")
+    })?;
+
+    diffy::merge(base_str, ours_str, theirs_str)
+        .map_err(|_conflict_text| OxenError::basic_str("Merge has conflicts -- cannot auto-merge"))
+}
+
 use super::index::restore;
 use super::index::restore::FileToRestore;
 

@@ -112,7 +112,7 @@ curl -H "Authorization: Bearer $TOKEN" \
      "http://0.0.0.0:3000/api/repos/my_namespace/MyRepo/file/main/hello.txt"
 ```
 
-If the file has been modified since the claimed revision, the server returns `400 Bad Request`.
+If the file has been modified since the claimed revision, the server attempts a 3-way text merge. If the changes don't overlap, the merge succeeds and the response includes a `merged_content` field with the combined result. If the changes conflict (or the file is binary), the server returns `400 Bad Request`.
 
 
 ## Logging

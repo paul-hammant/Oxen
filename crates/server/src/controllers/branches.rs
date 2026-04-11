@@ -347,6 +347,7 @@ pub async fn maybe_create_merge(
             return Ok(HttpResponse::Ok().json(CommitResponse {
                 status: StatusMessage::resource_found(),
                 commit: current_commit,
+                merged_content: None,
             }));
         }
         Err(e) => return Err(e.into()),
@@ -356,6 +357,7 @@ pub async fn maybe_create_merge(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_created(),
         commit: merge_commit,
+        merged_content: None,
     }))
 }
 

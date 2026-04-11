@@ -404,6 +404,7 @@ pub async fn show(req: HttpRequest) -> actix_web::Result<HttpResponse, OxenHttpE
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_found(),
         commit,
+        merged_content: None,
     }))
 }
 
@@ -711,6 +712,7 @@ pub async fn create(
         Ok(commit) => Ok(HttpResponse::Ok().json(CommitResponse {
             status: StatusMessage::resource_created(),
             commit: commit.to_owned(),
+            merged_content: None,
         })),
         Err(err) => {
             log::error!("Err create_commit: {err}");
@@ -1083,6 +1085,7 @@ pub async fn complete(req: HttpRequest) -> Result<HttpResponse, Error> {
                     let response = CommitResponse {
                         status: StatusMessage::resource_created(),
                         commit: commit.clone(),
+                        merged_content: None,
                     };
                     Ok(HttpResponse::Ok().json(response))
                 }
@@ -1164,6 +1167,7 @@ pub async fn upload_tree(
     Ok(HttpResponse::Ok().json(CommitResponse {
         status: StatusMessage::resource_found(),
         commit: server_head_commit.to_owned(),
+        merged_content: None,
     }))
 }
 
