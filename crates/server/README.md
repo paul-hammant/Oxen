@@ -76,8 +76,22 @@ curl -H "Authorization: Bearer $TOKEN" "http://0.0.0.0:3000/api/repos"
 
 #### Create Repository
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -X POST -d '{"name": "MyRepo"}' "http://0.0.0.0:3000api/repos"
+curl -H "Authorization: Bearer $TOKEN" -X POST -d '{"name": "MyRepo"}' "http://0.0.0.0:3000/api/repos"
 ```
+
+#### Import File from URL
+
+Import a file from a trusted external URL (huggingface.co, kaggle.com, oxen.ai) into a repository:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -X POST \
+     -d '{"download_url": "https://hub.oxen.ai/api/repos/datasets/GettingStarted/file/main/tables/cats_vs_dogs.tsv", "name": "ox", "email": "ox@oxen.ai"}' \
+     "http://0.0.0.0:3000/api/repos/my_namespace/MyRepo/import/main/data"
+```
+
+Only URLs from allowed domains are accepted. Other domains return `400 Bad Request` with "URL domain not allowed".
 
 
 ## Logging

@@ -172,6 +172,11 @@ pub async fn import(
         ));
     }
 
+    // Validate URL domain against allowlist
+    if !is_import_domain_allowed(&url_parsed) {
+        return Err(OxenHttpError::BadRequest("URL domain not allowed".into()));
+    }
+
     // Extract optional caller-specified filename from request body
     let filename = body
         .get("filename")
@@ -213,6 +218,17 @@ pub async fn import(
         status: StatusMessage::resource_created(),
         commit,
     }))
+}
+
+const ALLOWED_IMPORT_DOMAINS: &[&str] = &["huggingface.co", "kaggle.com", "oxen.ai", "hub.oxen.ai"];
+
+fn is_import_domain_allowed(url: &url::Url) -> bool {
+    match url.host_str() {
+        Some(host) => ALLOWED_IMPORT_DOMAINS
+            .iter()
+            .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}"))),
+        None => false,
+    }
 }
 
 /// Upload zip archive
@@ -480,6 +496,102 @@ mod tests {
 
     use actix_web::{App, web};
     use std::path::PathBuf;
+
+    async fn do_import(
+        sync_dir: &std::path::Path,
+        namespace: &'static str,
+        repo_name: &'static str,
+        download_url: &str,
+    ) -> actix_web::dev::ServiceResponse {
+        let uri = format!("/oxen/{namespace}/{repo_name}/file/import/main/data");
+        let body = serde_json::json!({
+            "download_url": download_url,
+            "name": "test_user",
+            "email": "test@example.com",
+        });
+
+        let req = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .app_data(OxenAppData::new(sync_dir.to_path_buf()))
+            .param("namespace", namespace)
+            .param("repo_name", repo_name)
+            .set_json(&body)
+            .to_request();
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(OxenAppData::new(sync_dir.to_path_buf()))
+                .route(
+                    "/oxen/{namespace}/{repo_name}/file/import/{resource:.*}",
+                    web::post().to(controllers::import::import),
+                ),
+        )
+        .await;
+
+        actix_web::test::call_service(&app, req).await
+    }
+
+    #[actix_web::test]
+    async fn test_import_blocked_domain_rejected() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-Name";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+        util::fs::create_dir_all(repo.path.join("data"))?;
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::write_to_path(&hello_file, "Hello")?;
+        repositories::add(&repo, &hello_file).await?;
+        let _commit = repositories::commit(&repo, "First commit")?;
+
+        let resp = do_import(
+            &sync_dir,
+            namespace,
+            repo_name,
+            "https://malicious-site.com/data.csv",
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "Blocked domain should return 400"
+        );
+        let bytes = actix_http::body::to_bytes(resp.into_body()).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains("URL domain not allowed"),
+            "Expected 'URL domain not allowed' in response, got: {body}"
+        );
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_import_malformed_url_rejected() -> Result<(), OxenError> {
+        liboxen::test::init_test_env();
+        let sync_dir = test::get_sync_dir()?;
+        let namespace = "Testing-Namespace";
+        let repo_name = "Testing-Name";
+        let repo = test::create_local_repo(&sync_dir, namespace, repo_name)?;
+        util::fs::create_dir_all(repo.path.join("data"))?;
+        let hello_file = repo.path.join("data/hello.txt");
+        util::fs::write_to_path(&hello_file, "Hello")?;
+        repositories::add(&repo, &hello_file).await?;
+        let _commit = repositories::commit(&repo, "First commit")?;
+
+        let resp = do_import(&sync_dir, namespace, repo_name, "not-a-valid-url").await;
+
+        assert!(
+            resp.status().is_client_error(),
+            "Malformed URL should return client error, got: {}",
+            resp.status()
+        );
+
+        test::cleanup_sync_dir(&sync_dir)?;
+        Ok(())
+    }
 
     #[actix_web::test]
     async fn test_controllers_file_import_tabular_file() -> Result<(), OxenError> {
